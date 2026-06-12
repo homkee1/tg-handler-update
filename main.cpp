@@ -9,13 +9,22 @@
 #include <cstdlib> // rand, srand
 #include <ctime>   // time
 #include <cmath>   // pow
+#include <uiautomation.h> // Для способа 2 (UI Automation)
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uiautomationcore.lib")
 
 enum UIState {
     UI_DASHBOARD,
     UI_LIST,
     UI_HELP
+};
+
+enum SendMethod {
+    METHOD_SENDINPUT,     // Стандартный (активное окно)
+    METHOD_POSTMESSAGE,   // Фоновый посимвольный (SendMessage/PostMessage)
+    METHOD_UIAUTOMATION   // Фоновый умный (UI Automation)
 };
 
 struct TypingOptions {
@@ -65,6 +74,13 @@ bool g_toggleRepeat = false;
 int g_toggleInterval = 500;
 bool g_isToggleActive = false;
 
+// Новые параметры: Метод отправки и остановка при потере фокуса
+SendMethod g_sendMethod = METHOD_SENDINPUT;
+bool g_stopOnFocusLoss = true;
+
+// Кэшированный дескриптор целевого окна для оптимизации производительности
+HWND g_cachedHwnd = NULL;
+
 // Хранилища настроек рандомизации
 RandomSettings g_randTr;
 RandomSettings g_randHr;
@@ -100,6 +116,71 @@ bool RegReadSZ(HKEY hKey, const std::wstring& valueName, std::wstring& value) {
     return false;
 }
 
+// Вспомогательные функции путей
+std::wstring GetFileName(const std::wstring& path) {
+    size_t pos = path.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? path : path.substr(pos + 1);
+}
+
+std::wstring GetExecutableDir() {
+    wchar_t buffer[MAX_PATH];
+    GetModuleFileNameW(NULL, buffer, MAX_PATH);
+    std::wstring path(buffer);
+    size_t pos = path.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? L"" : path.substr(0, pos + 1);
+}
+
+std::wstring GetPhrasesFilePath() {
+    std::wstring filename;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        filename = g_phrasesFile;
+    }
+    return GetExecutableDir() + filename;
+}
+
+// Поиск дескриптора окна (HWND) по имени исполняемого файла процесса
+struct EnumData {
+    std::wstring targetExe;
+    HWND foundHwnd;
+};
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    EnumData* data = reinterpret_cast<EnumData*>(lParam);
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (processId != 0) {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+        if (hProcess) {
+            wchar_t path[MAX_PATH];
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+                std::wstring exeName = GetFileName(path);
+                for (auto& c : exeName) c = towlower(c);
+                
+                std::wstring targetName = data->targetExe;
+                for (auto& c : targetName) c = towlower(c);
+
+                if (exeName == targetName && IsWindowVisible(hwnd)) {
+                    data->foundHwnd = hwnd;
+                    CloseHandle(hProcess);
+                    return FALSE; // Окно найдено, прекращаем перебор
+                }
+            }
+            CloseHandle(hProcess);
+        }
+    }
+    return TRUE;
+}
+
+HWND FindTargetWindow(const std::wstring& targetExe) {
+    EnumData data;
+    data.targetExe = targetExe;
+    data.foundHwnd = NULL;
+    EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&data));
+    return data.foundHwnd;
+}
+
 void SaveSettingsToRegistry() {
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\PhraseSender", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
@@ -118,6 +199,9 @@ void SaveSettingsToRegistry() {
         RegWriteDWORD(hKey, L"HoldInterval", g_holdInterval);
         RegWriteDWORD(hKey, L"ToggleRepeat", g_toggleRepeat ? 1 : 0);
         RegWriteDWORD(hKey, L"ToggleInterval", g_toggleInterval);
+
+        RegWriteDWORD(hKey, L"SendMethod", static_cast<DWORD>(g_sendMethod));
+        RegWriteDWORD(hKey, L"StopOnFocusLoss", g_stopOnFocusLoss ? 1 : 0);
 
         RegWriteDWORD(hKey, L"RandTr_Enabled", g_randTr.enabled ? 1 : 0);
         RegWriteDWORD(hKey, L"RandTr_Central", g_randTr.central);
@@ -162,6 +246,9 @@ void LoadSettingsFromRegistry() {
         if (RegReadDWORD(hKey, L"HoldInterval", val)) g_holdInterval = val;
         if (RegReadDWORD(hKey, L"ToggleRepeat", val)) g_toggleRepeat = (val != 0);
         if (RegReadDWORD(hKey, L"ToggleInterval", val)) g_toggleInterval = val;
+
+        if (RegReadDWORD(hKey, L"SendMethod", val)) g_sendMethod = static_cast<SendMethod>(val);
+        if (RegReadDWORD(hKey, L"StopOnFocusLoss", val)) g_stopOnFocusLoss = (val != 0);
 
         if (RegReadDWORD(hKey, L"RandTr_Enabled", val)) g_randTr.enabled = (val != 0);
         if (RegReadDWORD(hKey, L"RandTr_Central", val)) g_randTr.central = val;
@@ -243,28 +330,6 @@ int GetCurrentTypingDelay(int defaultDelay) {
         return GetRandomValue(g_randD.central, g_randD.left, g_randD.right, g_randD.deviation);
     }
     return defaultDelay;
-}
-
-std::wstring GetFileName(const std::wstring& path) {
-    size_t pos = path.find_last_of(L"\\/");
-    return (pos == std::wstring::npos) ? path : path.substr(pos + 1);
-}
-
-std::wstring GetExecutableDir() {
-    wchar_t buffer[MAX_PATH];
-    GetModuleFileNameW(NULL, buffer, MAX_PATH);
-    std::wstring path(buffer);
-    size_t pos = path.find_last_of(L"\\/");
-    return (pos == std::wstring::npos) ? L"" : path.substr(0, pos + 1);
-}
-
-std::wstring GetPhrasesFilePath() {
-    std::wstring filename;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        filename = g_phrasesFile;
-    }
-    return GetExecutableDir() + filename;
 }
 
 std::wstring Utf8ToWide(const std::string& utf8Str) {
@@ -430,6 +495,11 @@ void SendKey(WORD vk) {
     SendInput(2, inputs, sizeof(INPUT));
 }
 
+// ==========================================
+// МЕТОДЫ ОТПРАВКИ ТЕКСТА
+// ==========================================
+
+// Способ 1: Стандартный SendInput (Требует активности окна)
 void SendString(const std::wstring& str, const TypingOptions& opts) {
     if (opts.enterBefore) {
         SendKey(VK_RETURN);
@@ -490,6 +560,136 @@ void SendString(const std::wstring& str, const TypingOptions& opts) {
         SendKey(VK_RETURN);
     }
 }
+
+// Способ 2: Фоновый ввод через PostMessage/WM_CHAR
+void SendStringBackgroundPostMessage(HWND hwnd, const std::wstring& str, const TypingOptions& opts) {
+    if (!hwnd) return;
+
+    if (opts.enterBefore) {
+        PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+        PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0);
+        Sleep(opts.enterBeforeDelay);
+    }
+
+    for (wchar_t ch : str) {
+        PostMessageW(hwnd, WM_CHAR, ch, 0);
+        int delay = GetCurrentTypingDelay(opts.typingDelay);
+        if (delay > 0) Sleep(delay);
+    }
+
+    if (opts.enterAfter) {
+        Sleep(opts.enterAfterDelay);
+        PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+        PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0);
+    }
+}
+
+// Способ 3: Фоновый ввод через UI Automation (Исправлены дэдлоки и падения COM)
+bool SendStringUIAutomation(HWND hwnd, const std::wstring& str, const TypingOptions& opts) {
+    if (!hwnd) return false;
+
+    // ОШИБКА 2 ИСПРАВЛЕНА: Используем COINIT_MULTITHREADED (MTA) вместо STA для фоновых потоков без цикла сообщений
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    
+    // ОШИБКА 3 ИСПРАВЛЕНА: Вызовем CoUninitialize только если библиотека успешно инициализирована именно в этом вызове
+    bool needUninitialize = (hr == S_OK || hr == S_FALSE);
+
+    bool success = false;
+    IUIAutomation* pAutomation = NULL;
+    
+    HRESULT hrCo = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation), (void**)&pAutomation);
+    if (SUCCEEDED(hrCo) && pAutomation) {
+        IUIAutomationElement* pWindowElement = NULL;
+        hrCo = pAutomation->ElementFromHandle(hwnd, &pWindowElement);
+        if (SUCCEEDED(hrCo) && pWindowElement) {
+            IUIAutomationCondition* pCondition = NULL;
+            VARIANT varProp;
+            varProp.vt = VT_I4;
+            varProp.lVal = UIA_EditControlTypeId;
+            hrCo = pAutomation->CreatePropertyCondition(UIA_ControlTypePropertyId, varProp, &pCondition);
+            if (SUCCEEDED(hrCo) && pCondition) {
+                IUIAutomationElement* pEditElement = NULL;
+                hrCo = pWindowElement->FindFirst(TreeScope_Descendants, pCondition, &pEditElement);
+                if (SUCCEEDED(hrCo) && pEditElement) {
+                    IUIAutomationValuePattern* pValuePattern = NULL;
+                    hrCo = pEditElement->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pValuePattern);
+                    if (SUCCEEDED(hrCo) && pValuePattern) {
+                        BSTR bstrVal = SysAllocString(str.c_str());
+                        hrCo = pValuePattern->SetValue(bstrVal);
+                        if (SUCCEEDED(hrCo)) {
+                            success = true;
+                        }
+                        SysFreeString(bstrVal);
+                        pValuePattern->Release();
+                    }
+                    pEditElement->Release();
+                }
+                pCondition->Release();
+            }
+            pWindowElement->Release();
+        }
+        pAutomation->Release();
+    }
+    
+    if (needUninitialize) {
+        CoUninitialize();
+    }
+
+    if (success && opts.enterAfter) {
+        Sleep(opts.enterAfterDelay);
+        PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+        PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0);
+    }
+    return success;
+}
+
+// Диспетчер отправки, перенаправляющий вызовы по методам (Исправлена производительность и дэдлоки)
+void DispatchSendString(const std::wstring& str, const TypingOptions& opts) {
+    SendMethod method;
+    std::wstring target;
+    HWND hwnd = NULL;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        method = g_sendMethod;
+        target = g_targetProcess;
+        hwnd = g_cachedHwnd;
+    }
+
+    if (method == METHOD_SENDINPUT) {
+        SendString(str, opts);
+    } else {
+        // ОШИБКА 4 (И ДЭДЛОК) ИСПРАВЛЕНЫ: Ищем окно БЕЗ удержания глобального g_mutex!
+        // Это предотвращает зависание хука клавиатуры на основном потоке.
+        if (!hwnd || !IsWindow(hwnd)) {
+            HWND foundHwnd = FindTargetWindow(target); // Тяжелый поиск за пределами мьютекса
+            
+            std::lock_guard<std::mutex> lock(g_mutex);
+            // Проверяем, не изменился ли целевой процесс в консоли во время поиска (защита от race condition)
+            if (g_targetProcess == target) {
+                g_cachedHwnd = foundHwnd;
+                hwnd = foundHwnd;
+            } else {
+                hwnd = g_cachedHwnd; // Если сменился, берем актуальное значение
+            }
+        }
+
+        if (hwnd) {
+            if (method == METHOD_POSTMESSAGE) {
+                SendStringBackgroundPostMessage(hwnd, str, opts);
+            } else if (method == METHOD_UIAUTOMATION) {
+                if (!SendStringUIAutomation(hwnd, str, opts)) {
+                    SendStringBackgroundPostMessage(hwnd, str, opts);
+                }
+            }
+        } else {
+            // Если фоновое окно не найдено, выводим в активное в качестве резерва
+            SendString(str, opts);
+        }
+    }
+}
+
+// ==========================================
 
 // Парсинг числового диапазона вида "100-500"
 bool ParseRange(const std::wstring& str, int& left, int& right) {
@@ -642,6 +842,8 @@ void RedrawUI() {
         std::wcout << L"tr [ms]     - Вкл режим триггера или задать интервал повтора (напр: tr 500)" << std::endl;
         std::wcout << L"rtr/rhr/rd  - Настройка рандомизации для tr, hr или d соответственно" << std::endl;
         std::wcout << L"              (напр: rtr 500 100-1000 30 | без аргументов — Вкл/Выкл)" << std::endl;
+        std::wcout << L"sm <method> - Сменить метод отправки. Доступно: si (SendInput), pm (PostMessage), uia (UI Automation)" << std::endl;
+        std::wcout << L"sfl         - Вкл/Выкл остановку цикла повтора при потере фокуса" << std::endl;
         std::wcout << L"reg         - Включить/Выключить автоматическое сохранение настроек в реестр" << std::endl;
         std::wcout << L"df / resetcfg - Сбросить конфигурацию к заводским настройкам" << std::endl;
         std::wcout << L"l           - Посмотреть пронумерованный список фраз" << std::endl;
@@ -710,15 +912,20 @@ void RedrawUI() {
         dStr = L"Мгновенно";
     }
 
+    std::wstring methodStr = L"SendInput (Активное окно)";
+    if (g_sendMethod == METHOD_POSTMESSAGE) methodStr = L"PostMessage (Фоновый ввод)";
+    else if (g_sendMethod == METHOD_UIAUTOMATION) methodStr = L"UI Automation (Фоновый умный)";
+
     std::wcout << L"[Инфо ] ";
     std::wcout << L"Индекс: " << (total > 0 ? (g_phraseIndex % total) + 1 : 0) << L"/" << total << L" (Абс: " << g_phraseIndex << L") | ";
     std::wcout << L"Кнопка: " << KeyToString(g_hotkey) << L" | Файл: " << g_phrasesFile << std::endl;
-    std::wcout << L"[Режим] " << modeStr << L" | Окно: " << (g_checkWindow ? g_targetProcess : L"БЕЗ ПРОВЕРКИ") << std::endl;
+    std::wcout << L"[Режим] " << modeStr << L" | Окно: " << (g_checkWindow ? g_targetProcess : L"БЕЗ ПРОВЕРКИ") << L" [Стоп-фокус: " << (g_stopOnFocusLoss ? L"ВКЛ" : L"ВЫКЛ") << L"]" << std::endl;
     
     std::wcout << L"[Опции] ";
     std::wcout << L"Enter до: " << (g_enterBefore ? (std::to_wstring(g_enterBeforeDelay) + L"мс") : L"Выкл")
                << L" | Enter после: " << (g_enterAfter ? (std::to_wstring(g_enterAfterDelay) + L"мс") : L"Выкл")
                << L" | Задержка букв: " << dStr << L" | Реестр: " << (g_useRegistry ? L"ВКЛ" : L"ВЫКЛ") << std::endl;
+    std::wcout << L"[Метод] " << methodStr << std::endl;
     
     std::wcout << L"----------------------------------------" << std::endl;
     std::wcout << L"Введите 'h' для вывода списка всех коротких команд." << std::endl;
@@ -740,6 +947,7 @@ void WorkerThreadFunc() {
 
         std::wstring target;
         bool check = true;
+        bool stopOnFocusLoss = true;
 
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -754,9 +962,11 @@ void WorkerThreadFunc() {
             }
             target = g_targetProcess;
             check = g_checkWindow;
+            stopOnFocusLoss = g_stopOnFocusLoss;
         }
 
-        if (isActive) {
+        // Проверяем потерю фокуса, только если включена опция g_stopOnFocusLoss
+        if (isActive && stopOnFocusLoss) {
             if (!IsTargetWindow(GetForegroundWindow(), target, check)) {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_isHotkeyHeld = false;
@@ -800,7 +1010,7 @@ void WorkerThreadFunc() {
         }
 
         if (!phrase.empty()) {
-            SendString(phrase, opts);
+            DispatchSendString(phrase, opts);
             RedrawUI();
         }
     }
@@ -868,7 +1078,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
                         if (!phrase.empty()) {
                             std::thread([phrase, opts]() {
-                                SendString(phrase, opts);
+                                DispatchSendString(phrase, opts);
                                 RedrawUI();
                             }).detach();
                         }
@@ -925,7 +1135,12 @@ void ConsoleThreadFunc() {
         UIState nextState = UI_DASHBOARD; 
 
         if (cmd == L"q" || cmd == L"exit") {
-            PostQuitMessage(0);
+            // ОШИБКА 1 ИСПРАВЛЕНА: Чистим хук и корректно выходим из процесса через ExitProcess, так как это фоновый поток
+            if (hHook) {
+                UnhookWindowsHookEx(hHook);
+                hHook = NULL;
+            }
+            ExitProcess(0);
             break;
         }
         else if (cmd == L"g" || cmd == L"goto") {
@@ -982,6 +1197,7 @@ void ConsoleThreadFunc() {
                     std::lock_guard<std::mutex> lock(g_mutex);
                     g_targetProcess = arg;
                     g_checkWindow = true;
+                    g_cachedHwnd = NULL; // Оптимизация: Сбрасываем кэш HWND при смене процесса
                 }
                 feedback = L"Целевое окно изменено на: " + arg;
                 AutoSave();
@@ -1048,13 +1264,12 @@ void ConsoleThreadFunc() {
                     g_phrasesFile = newFile;
                     g_phrases = std::move(loadedPhrases);
                     
-                    // Решение проблемы 1: Сбрасываем только в том случае, если текущий 
-                    // индекс выходит за границы нового файла
                     if (g_phraseIndex >= g_phrases.size()) {
                         g_phraseIndex = 0;
                     }
                     g_accumulatedTimeMs = 0;
                     g_needNewInterval = true;
+                    g_cachedHwnd = NULL; // Оптимизация: Сбрасываем кэш HWND
                     count = g_phrases.size();
                 }
                 feedback = L"Активный файл изменен на: " + newFile + L" (Найдено фраз: " + std::to_wstring(count) + L")";
@@ -1180,6 +1395,44 @@ void ConsoleThreadFunc() {
             ProcessRandomSettings(g_randD, arg, feedback, L"d");
             AutoSave();
         }
+        else if (cmd == L"sm" || cmd == L"sendmethod") {
+            std::wstring methodStr = arg;
+            for (auto& c : methodStr) c = towlower(c);
+
+            bool isMethodChanged = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (methodStr == L"si" || methodStr == L"sendinput" || methodStr == L"1") {
+                    g_sendMethod = METHOD_SENDINPUT;
+                    feedback = L"Метод отправки изменен на: SendInput (активное окно)";
+                    isMethodChanged = true;
+                } else if (methodStr == L"pm" || methodStr == L"postmessage" || methodStr == L"2") {
+                    g_sendMethod = METHOD_POSTMESSAGE;
+                    feedback = L"Метод отправки изменен на: PostMessage (фоновый ввод)";
+                    isMethodChanged = true;
+                } else if (methodStr == L"uia" || methodStr == L"uiautomation" || methodStr == L"3") {
+                    g_sendMethod = METHOD_UIAUTOMATION;
+                    feedback = L"Метод отправки изменен на: UI Automation (фоновый умный)";
+                    isMethodChanged = true;
+                } else {
+                    feedback = L"Ошибка! Неизвестный метод. Доступны: si (SendInput), pm (PostMessage), uia (UI Automation)";
+                }
+            } // Локальная область видимости закрыта — мьютекс безопасно освобождается перед AutoSave()
+
+            if (isMethodChanged) {
+                AutoSave();
+            }
+        }
+        else if (cmd == L"sfl" || cmd == L"stopfocus") {
+            bool currentSfl = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_stopOnFocusLoss = !g_stopOnFocusLoss;
+                currentSfl = g_stopOnFocusLoss;
+            }
+            feedback = L"Остановка цикла при потере фокуса целевого окна: " + std::wstring(currentSfl ? L"ВКЛЮЧЕНА" : L"ВЫКЛЮЧЕНА");
+            AutoSave();
+        }
         else if (cmd == L"reg") {
             bool currentReg = false;
             {
@@ -1218,6 +1471,9 @@ void ConsoleThreadFunc() {
                 g_toggleInterval = 500;
                 g_isHotkeyHeld = false;
                 g_isToggleActive = false;
+                g_sendMethod = METHOD_SENDINPUT;
+                g_stopOnFocusLoss = true;
+                g_cachedHwnd = NULL; // Оптимизация: Сброс кэша HWND
                 g_randTr = RandomSettings{};
                 g_randHr = RandomSettings{};
                 g_randD = RandomSettings{};

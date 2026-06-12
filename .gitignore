@@ -66,4 +66,8 @@ vcpkg_installed/
 
 # test output & cache
 Testing/
+<<<<<<< HEAD
 .cache/
+=======
+.cache/
+>>>>>>> 18fefd8b97c99b3001d451e77db2154fd084add8
