@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.10.0)
-project(CxxAxisCoord VERSION 0.1.0 LANGUAGES C CXX)
+project(TelegramHandler VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(CxxAxisCoord main.cpp)
+add_executable(TelegramHandler main.cpp)
 
-target_link_libraries(CxxAxisCoord PRIVATE User32 Kernel32)
+target_link_libraries(TelegramHandler PRIVATE User32 Kernel32)
