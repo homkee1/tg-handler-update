@@ -1,3 +1,4 @@
+﻿#define NOMINMAX
 #include <windows.h>
 #include <iostream>
 #include <string>
@@ -63,6 +64,110 @@ void WriteInputField(IUIAutomation* pAutomation, IUIAutomationElement* pRoot, co
         std::wcout << L"[-] нет доступа к ValuePattern поля ввода" << std::endl;
     }
     pEdit->Release();
+}
+
+void WriteAndSendInputField(IUIAutomation* pAutomation, IUIAutomationElement* pRoot, const std::wstring& text) {
+    IUIAutomationElement* pEdit = FindInputField(pAutomation, pRoot);
+    if (!pEdit) {
+        std::wcout << L"[-] поле ввода не найдено откройте какой-либо чат" << std::endl;
+        return;
+    }
+
+    std::wstring originalText;
+    IUIAutomationValuePattern* pValuePattern = nullptr;
+    HRESULT hr = pEdit->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pValuePattern);
+    if (SUCCEEDED(hr) && pValuePattern) {
+        BSTR bstrVal = nullptr;
+        if (SUCCEEDED(pValuePattern->get_CurrentValue(&bstrVal)) && bstrVal) {
+            originalText = bstrVal;
+            SysFreeString(bstrVal);
+        }
+
+        BSTR bstrText = SysAllocString(text.c_str());
+        hr = pValuePattern->SetValue(bstrText); 
+        SysFreeString(bstrText);
+        pValuePattern->Release();
+    } else {
+        std::wcout << L"[-] нет доступа к ValuePattern поля ввода" << std::endl;
+        pEdit->Release();
+        return;
+    }
+    pEdit->Release();
+
+    if (FAILED(hr)) {
+        std::wcout << L"[-] ошибка записи текста" << std::endl;
+        return;
+    }
+
+    //Sleep(100);
+
+    IUIAutomationCondition* pButtonCond = nullptr;
+    VARIANT varButton;
+    varButton.vt = VT_I4;
+    varButton.lVal = UIA_ButtonControlTypeId;
+    pAutomation->CreatePropertyCondition(UIA_ControlTypePropertyId, varButton, &pButtonCond);
+
+    IUIAutomationCondition* pNameSend = nullptr;
+    VARIANT varSend;
+    varSend.vt = VT_BSTR;
+    varSend.bstrVal = SysAllocString(L"Send");
+    pAutomation->CreatePropertyCondition(UIA_NamePropertyId, varSend, &pNameSend);
+    SysFreeString(varSend.bstrVal);
+
+    IUIAutomationCondition* pNameOtpravit = nullptr;
+    VARIANT varOtpravit;
+    varOtpravit.vt = VT_BSTR;
+    varOtpravit.bstrVal = SysAllocString(L"Отправить");
+    pAutomation->CreatePropertyCondition(UIA_NamePropertyId, varOtpravit, &pNameOtpravit);
+    SysFreeString(varOtpravit.bstrVal);
+
+    IUIAutomationCondition* pNameOrCond = nullptr;
+    pAutomation->CreateOrCondition(pNameSend, pNameOtpravit, &pNameOrCond);
+    pNameSend->Release();
+    pNameOtpravit->Release();
+
+    IUIAutomationCondition* pFullSendCond = nullptr;
+    pAutomation->CreateAndCondition(pButtonCond, pNameOrCond, &pFullSendCond);
+    pButtonCond->Release();
+    pNameOrCond->Release();
+
+    IUIAutomationElement* pSendButton = nullptr;
+    hr = pRoot->FindFirst(TreeScope_Subtree, pFullSendCond, &pSendButton);
+    pFullSendCond->Release();
+
+    bool sentSuccessfully = false;
+    if (SUCCEEDED(hr) && pSendButton) {
+        IUIAutomationInvokePattern* pInvokePattern = nullptr;
+        hr = pSendButton->GetCurrentPattern(UIA_InvokePatternId, (IUnknown**)&pInvokePattern);
+        if (SUCCEEDED(hr) && pInvokePattern) {
+            hr = pInvokePattern->Invoke();
+            pInvokePattern->Release();
+            std::wcout << L"[+] сообщение отправлено" << std::endl;
+            sentSuccessfully = true;
+        } else {
+            std::wcout << L"[-] нет доступа к InvokePattern кнопки отправки" << std::endl;
+        }
+        pSendButton->Release();
+    } else {
+        std::wcout << L"[-] кнопка отправки не найдена (проверьте, что чат открыт)" << std::endl;
+    }
+    if (!originalText.empty()) {
+        if (sentSuccessfully) {
+            //Sleep(150);
+        }
+
+        IUIAutomationElement* pEditRestore = FindInputField(pAutomation, pRoot);
+        if (pEditRestore) {
+            IUIAutomationValuePattern* pValuePatternRestore = nullptr;
+            if (SUCCEEDED(pEditRestore->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pValuePatternRestore)) && pValuePatternRestore) {
+                BSTR bstrOriginal = SysAllocString(originalText.c_str());
+                pValuePatternRestore->SetValue(bstrOriginal);
+                SysFreeString(bstrOriginal);
+                pValuePatternRestore->Release();
+            }
+            pEditRestore->Release();
+        }
+    }
 }
 
 void ViewInputField(IUIAutomation* pAutomation, IUIAutomationElement* pRoot) {
@@ -146,6 +251,7 @@ void PrintHelp() {
     std::wcout << L"=== справка по консольному управлению тг ===" << std::endl;
     std::wcout << L"h / help          - вывести эту справку" << std::endl;
     std::wcout << L"w / write <текст> - вписать текст в поле ввода сообщения (БЕЗ ФОКУСА)" << std::endl;
+    std::wcout << L"s / send <текст>  - отправить текст (сохраняя уже написанный черновик)" << std::endl;
     std::wcout << L"v / view          - глянуть, что сейчас написано в поле ввода" << std::endl;
     std::wcout << L"r / read [кол-во] - считать N последних сообщений (по умолчанию: 5)" << std::endl;
     std::wcout << L"cls / clear       - очистить консоль" << std::endl;
@@ -236,6 +342,13 @@ int main() {
                     std::wcout << L"[-] укажите текст для ввода, например: write Привет" << std::endl;
                 } else {
                     WriteInputField(pAutomation, pRootElement, arg);
+                }
+            }
+            else if (cmd == L"s" || cmd == L"send") {
+                if (arg.empty()) {
+                    std::wcout << L"[-] укажите текст для отправки, например: send Привет" << std::endl;
+                } else {
+                    WriteAndSendInputField(pAutomation, pRootElement, arg);
                 }
             }
             else if (cmd == L"v" || cmd == L"view") {
