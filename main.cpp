@@ -50,16 +50,33 @@ void WriteInputField(IUIAutomation* pAutomation, IUIAutomationElement* pRoot, co
     HRESULT hr = pEdit->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pValuePattern);
     if (SUCCEEDED(hr) && pValuePattern) {
         BSTR bstrText = SysAllocString(text.c_str());
-        
         hr = pValuePattern->SetValue(bstrText); 
-        
+        SysFreeString(bstrText);
+        pValuePattern->Release();
+
         if (SUCCEEDED(hr)) {
             std::wcout << L"[+] текст записан" << std::endl;
+
+            // Перемещение курсора (каретки) в конец текста
+            IUIAutomationTextPattern* pTextPattern = nullptr;
+            hr = pEdit->GetCurrentPattern(UIA_TextPatternId, (IUnknown**)&pTextPattern);
+            if (SUCCEEDED(hr) && pTextPattern) {
+                IUIAutomationTextRange* pDocRange = nullptr;
+                hr = pTextPattern->get_DocumentRange(&pDocRange);
+                if (SUCCEEDED(hr) && pDocRange) {
+                    // Переносим НАЧАЛО (Start) диапазона в точку, где находится КОНЕЦ (End)
+                    hr = pDocRange->MoveEndpointByRange(TextPatternRangeEndpoint_Start, pDocRange, TextPatternRangeEndpoint_End);
+                    if (SUCCEEDED(hr)) {
+                        // "Выделяем" пустой диапазон — это устанавливает курсор в конец текста
+                        pDocRange->Select();
+                    }
+                    pDocRange->Release();
+                }
+                pTextPattern->Release();
+            }
         } else {
             std::wcout << L"[-] ошибка записи текста" << std::endl;
         }
-        SysFreeString(bstrText);
-        pValuePattern->Release();
     } else {
         std::wcout << L"[-] нет доступа к ValuePattern поля ввода" << std::endl;
     }
@@ -67,6 +84,7 @@ void WriteInputField(IUIAutomation* pAutomation, IUIAutomationElement* pRoot, co
 }
 
 void WriteAndSendInputField(IUIAutomation* pAutomation, IUIAutomationElement* pRoot, const std::wstring& text) {
+    Sleep(3000);
     IUIAutomationElement* pEdit = FindInputField(pAutomation, pRoot);
     if (!pEdit) {
         std::wcout << L"[-] поле ввода не найдено откройте какой-либо чат" << std::endl;
@@ -151,6 +169,7 @@ void WriteAndSendInputField(IUIAutomation* pAutomation, IUIAutomationElement* pR
     } else {
         std::wcout << L"[-] кнопка отправки не найдена (проверьте, что чат открыт)" << std::endl;
     }
+
     if (!originalText.empty()) {
         if (sentSuccessfully) {
             //Sleep(150);
@@ -164,6 +183,18 @@ void WriteAndSendInputField(IUIAutomation* pAutomation, IUIAutomationElement* pR
                 pValuePatternRestore->SetValue(bstrOriginal);
                 SysFreeString(bstrOriginal);
                 pValuePatternRestore->Release();
+
+                // Сдвигаем курсор восстановленного черновика в самый конец
+                IUIAutomationTextPattern* pTextPatternRestore = nullptr;
+                if (SUCCEEDED(pEditRestore->GetCurrentPattern(UIA_TextPatternId, (IUnknown**)&pTextPatternRestore)) && pTextPatternRestore) {
+                    IUIAutomationTextRange* pDocRangeRestore = nullptr;
+                    if (SUCCEEDED(pTextPatternRestore->get_DocumentRange(&pDocRangeRestore)) && pDocRangeRestore) {
+                        pDocRangeRestore->MoveEndpointByRange(TextPatternRangeEndpoint_Start, pDocRangeRestore, TextPatternRangeEndpoint_End);
+                        pDocRangeRestore->Select();
+                        pDocRangeRestore->Release();
+                    }
+                    pTextPatternRestore->Release();
+                }
             }
             pEditRestore->Release();
         }
